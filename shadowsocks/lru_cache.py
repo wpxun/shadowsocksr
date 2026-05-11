@@ -87,11 +87,11 @@ class LRUCache(collections.MutableMapping):
             for key in self._keys_to_last_time:
                 return key
 
-    def sweep(self, sweep_item_cnt = SWEEP_MAX_ITEMS):
+    def sweep(self):
         # O(n - m)
         now = time.time()
         c = 0
-        while c < sweep_item_cnt:
+        while True:
             if len(self._keys_to_last_time) == 0:
                 break
             for key in self._keys_to_last_time:

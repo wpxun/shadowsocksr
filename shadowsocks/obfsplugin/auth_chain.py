@@ -187,6 +187,7 @@ class obfs_auth_chain_data(object):
         if user_id not in self.user_id:
             self.user_id[user_id] = lru_cache.LRUCache()
         local_client_id = self.user_id[user_id]
+        local_client_id.sweep()
 
         if client_id in local_client_id:
             local_client_id[client_id].update()
@@ -199,6 +200,7 @@ class obfs_auth_chain_data(object):
         if user_id not in self.user_id:
             self.user_id[user_id] = lru_cache.LRUCache()
         local_client_id = self.user_id[user_id]
+        local_client_id.sweep()
 
         if local_client_id.get(client_id, None) is None or not local_client_id[client_id].enable:
             if local_client_id.first() is None or len(local_client_id) < self.max_client:
@@ -226,6 +228,7 @@ class obfs_auth_chain_data(object):
     def remove(self, user_id, client_id):
         if user_id in self.user_id:
             local_client_id = self.user_id[user_id]
+            local_client_id.sweep()
             if client_id in local_client_id:
                 local_client_id[client_id].delref()
 

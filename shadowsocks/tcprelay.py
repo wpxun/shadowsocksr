@@ -1168,6 +1168,10 @@ class TCPRelayHandler(object):
         if self._add_ref > 0:
             self._server.add_connection(-1)
             self._server.stat_add(self._client_address[0], -1)
+        self._server = None
+        self._fd_to_handlers = None
+        self._loop = None
+        self._dns_resolver = None
 
 class TCPRelay(object):
     def __init__(self, config, dns_resolver, is_local, stat_callback=None, stat_counter=None):
