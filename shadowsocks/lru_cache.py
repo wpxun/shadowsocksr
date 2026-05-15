@@ -41,7 +41,12 @@ except:
 
 SWEEP_MAX_ITEMS = 1024
 
-class LRUCache(collections.MutableMapping):
+try:
+    from collections.abc import MutableMapping
+except ImportError:
+    from collections import MutableMapping
+
+class LRUCache(MutableMapping):
     """This class is not thread safe"""
 
     def __init__(self, timeout=60, close_callback=None, *args, **kwargs):

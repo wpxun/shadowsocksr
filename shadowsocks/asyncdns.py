@@ -18,6 +18,7 @@
 from __future__ import absolute_import, division, print_function, \
     with_statement
 
+import time
 import os
 import socket
 import struct
@@ -34,6 +35,8 @@ from shadowsocks import common, lru_cache, eventloop, shell
 
 
 CACHE_SWEEP_INTERVAL = 30
+DNS_PENDING_TIMEOUT = 15
+DNS_MAX_PENDING_CALLBACKS = 256
 
 VALID_HOSTNAME = re.compile(br"(?!-)[A-Z\d_-]{1,63}(?<!-)$", re.IGNORECASE)
 
@@ -272,6 +275,7 @@ class DNSResolver(object):
         self._hosts = {}
         self._hostname_status = {}
         self._hostname_to_cb = {}
+        self._hostname_to_last_time = {}
         self._cb_to_hostname = {}
         self._cache = lru_cache.LRUCache(timeout=300)
         self._sock = None
@@ -367,6 +371,8 @@ class DNSResolver(object):
                          Exception('unable to parse hostname %s' % hostname))
         if hostname in self._hostname_to_cb:
             del self._hostname_to_cb[hostname]
+        if hostname in self._hostname_to_last_time:
+            del self._hostname_to_last_time[hostname]
         if hostname in self._hostname_status:
             del self._hostname_status[hostname]
 
@@ -430,6 +436,14 @@ class DNSResolver(object):
 
     def handle_periodic(self):
         self._cache.sweep()
+        now = time.time()
+        to_remove = []
+        for hostname, last_t in list(self._hostname_to_last_time.items()):
+            if now - last_t > DNS_PENDING_TIMEOUT:
+                to_remove.append(hostname)
+        for hostname in to_remove:
+            logging.warn('DNS resolver timeout for %s', hostname)
+            self._call_callback(hostname, None, Exception('DNS request timeout'))
 
     def remove_callback(self, callback):
         hostname = self._cb_to_hostname.get(callback)
@@ -440,6 +454,8 @@ class DNSResolver(object):
                 arr.remove(callback)
                 if not arr:
                     del self._hostname_to_cb[hostname]
+                    if hostname in self._hostname_to_last_time:
+                        del self._hostname_to_last_time[hostname]
                     if hostname in self._hostname_status:
                         del self._hostname_status[hostname]
 
@@ -466,6 +482,9 @@ class DNSResolver(object):
             ip = self._cache[hostname]
             callback((hostname, ip), None)
         else:
+            if hostname.lower().rstrip(b'.').endswith(b'.local'):
+                callback(None, None)
+                return
             if not is_valid_hostname(hostname):
                 callback(None, Exception('invalid hostname: %s' % hostname))
                 return
@@ -487,9 +506,16 @@ class DNSResolver(object):
                     self._hostname_status[hostname] = STATUS_IPV4
                     self._send_req(hostname, QTYPE_A)
                 self._hostname_to_cb[hostname] = [callback]
+                self._hostname_to_last_time[hostname] = time.time()
                 self._cb_to_hostname[callback] = hostname
             else:
+                if len(arr) >= DNS_MAX_PENDING_CALLBACKS:
+                    logging.warn('DNS pending queue for %s reached limit %d',
+                                 hostname, DNS_MAX_PENDING_CALLBACKS)
+                    callback(None, Exception('DNS pending queue limit reached: %s' % hostname))
+                    return
                 arr.append(callback)
+                self._cb_to_hostname[callback] = hostname
                 # TODO send again only if waited too long
                 if IPV6_CONNECTION_SUPPORT:
                     self._send_req(hostname, QTYPE_AAAA)
@@ -552,4 +578,3 @@ def test():
 
 if __name__ == '__main__':
     test()
-
