@@ -94,3 +94,8 @@ sudo journalctl -u ssr -n 30 --no-pager
 ```
 
 内存排查同时记录采样时间、进程运行时长、RSS、文件描述符/连接数、DNS 待处理量及 OOM 记录。重启后的低内存或短时间稳定，不能单独证明长期泄漏已经消失。
+
+该程序部署在这台服务器，可以连接查看服务器运行情况和日志等。
+ip: 18.136.226.37
+username: centos
+Private keys: /Users/dd/.ssh/aws/LightsailDefaultKey-ap-southeast-1.pem
