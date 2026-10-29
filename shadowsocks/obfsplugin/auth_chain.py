@@ -36,6 +36,7 @@ import bisect
 import shadowsocks
 from shadowsocks import common, lru_cache, encrypt
 from shadowsocks.obfsplugin import plain
+from shadowsocks.obfsplugin.auth import sweep_client_cache
 from shadowsocks.common import to_bytes, to_str, ord, chr
 
 def create_auth_chain_a(method):
@@ -141,7 +142,11 @@ class client_queue(object):
             self.ref -= 1
 
     def is_active(self):
-        return (self.ref > 0) and (time.time() - self.last_update < 60 * 10)
+        # A live connection still owns this queue even after a long idle period.
+        return self.ref > 0
+
+    def is_expired(self, now):
+        return self.ref == 0 and now - self.last_update >= 60 * 10
 
     def re_enable(self, connection_id):
         self.enable = True
@@ -183,13 +188,31 @@ class obfs_auth_chain_data(object):
         self.connection_id = 0
         self.set_max_client(64) # max active client count
 
-    def update(self, user_id, client_id, connection_id):
-        if user_id not in self.user_id:
-            self.user_id[user_id] = lru_cache.LRUCache()
-        local_client_id = self.user_id[user_id]
-        local_client_id.sweep()
+    def _get_client_cache(self, user_id, create=False):
+        cache = self.user_id.get(user_id)
+        if cache is not None:
+            sweep_client_cache(cache)
+            if not cache:
+                del self.user_id[user_id]
+                cache = None
+        if cache is None and create:
+            cache = lru_cache.LRUCache()
+            self.user_id[user_id] = cache
+        return cache
 
-        if client_id in local_client_id:
+    def get_client_queue(self, user_id, client_id):
+        cache = self.user_id.get(user_id)
+        return cache.peek(client_id) if cache is not None else None
+
+    def update(self, user_id, client_id, connection_id, queue=None):
+        local_client_id = self._get_client_cache(user_id)
+        if queue is not None:
+            if local_client_id is not None and local_client_id.peek(client_id) is queue:
+                # Keep active clients at the MRU end for capacity eviction.
+                local_client_id[client_id].update()
+            else:
+                queue.update()
+        elif local_client_id is not None and client_id in local_client_id:
             local_client_id[client_id].update()
 
     def set_max_client(self, max_client):
@@ -197,10 +220,7 @@ class obfs_auth_chain_data(object):
         self.max_buffer = max(self.max_client * 2, 1024)
 
     def insert(self, user_id, client_id, connection_id):
-        if user_id not in self.user_id:
-            self.user_id[user_id] = lru_cache.LRUCache()
-        local_client_id = self.user_id[user_id]
-        local_client_id.sweep()
+        local_client_id = self._get_client_cache(user_id, create=True)
 
         if local_client_id.get(client_id, None) is None or not local_client_id[client_id].enable:
             if local_client_id.first() is None or len(local_client_id) < self.max_client:
@@ -211,8 +231,9 @@ class obfs_auth_chain_data(object):
                     local_client_id[client_id].re_enable(connection_id)
                 return local_client_id[client_id].insert(connection_id)
 
-            if not local_client_id[local_client_id.first()].is_active():
-                del local_client_id[local_client_id.first()]
+            oldest_client_id = local_client_id.first()
+            if not local_client_id.peek(oldest_client_id).is_active():
+                del local_client_id[oldest_client_id]
                 if client_id not in local_client_id:
                     #TODO: check
                     local_client_id[client_id] = client_queue(connection_id)
@@ -225,12 +246,12 @@ class obfs_auth_chain_data(object):
         else:
             return local_client_id[client_id].insert(connection_id)
 
-    def remove(self, user_id, client_id):
-        if user_id in self.user_id:
-            local_client_id = self.user_id[user_id]
-            local_client_id.sweep()
-            if client_id in local_client_id:
-                local_client_id[client_id].delref()
+    def remove(self, user_id, client_id, queue=None):
+        if queue is None:
+            queue = self.get_client_queue(user_id, client_id)
+        if queue is not None:
+            queue.delref()
+        self._get_client_cache(user_id)
 
 class auth_chain_a(auth_base):
     def __init__(self, method):
@@ -258,6 +279,7 @@ class auth_chain_a(auth_base):
         self.random_client = xorshift128plus()
         self.random_server = xorshift128plus()
         self.encryptor = None
+        self._client_queue = None
 
     def init_data(self):
         return obfs_auth_chain_data(self.method)
@@ -512,6 +534,7 @@ class auth_chain_a(auth_base):
                 self.has_recv_header = True
                 self.client_id = client_id
                 self.connection_id = connection_id
+                self._client_queue = self.server_info.data.get_client_queue(self.user_id, client_id)
             else:
                 logging.info('%s: auth fail, data %s' % (self.no_compatible_method, binascii.hexlify(out_buf)))
                 return self.not_match_return(self.recv_buf)
@@ -559,7 +582,8 @@ class auth_chain_a(auth_base):
                 sendback = True
 
         if out_buf:
-            self.server_info.data.update(self.user_id, self.client_id, self.connection_id)
+            self.server_info.data.update(self.user_id, self.client_id, self.connection_id,
+                                         queue=self._client_queue)
         return (out_buf, sendback)
 
     def client_udp_pre_encrypt(self, buf):
@@ -635,7 +659,10 @@ class auth_chain_a(auth_base):
         return (out_buf, uid)
 
     def dispose(self):
-        self.server_info.data.remove(self.user_id, self.client_id)
+        queue = self._client_queue
+        self._client_queue = None
+        if queue is not None:
+            self.server_info.data.remove(self.user_id, self.client_id, queue=queue)
 
 class auth_chain_b(auth_chain_a):
     def __init__(self, method):

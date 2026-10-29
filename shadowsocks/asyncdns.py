@@ -37,6 +37,7 @@ from shadowsocks import common, lru_cache, eventloop, shell
 CACHE_SWEEP_INTERVAL = 30
 DNS_PENDING_TIMEOUT = 15
 DNS_MAX_PENDING_CALLBACKS = 256
+DNS_MAX_TOTAL_PENDING_CALLBACKS = 4096
 
 VALID_HOSTNAME = re.compile(br"(?!-)[A-Z\d_-]{1,63}(?<!-)$", re.IGNORECASE)
 
@@ -277,6 +278,7 @@ class DNSResolver(object):
         self._hostname_to_cb = {}
         self._hostname_to_last_time = {}
         self._cb_to_hostname = {}
+        self._pending_callback_count = 0
         self._cache = lru_cache.LRUCache(timeout=300)
         self._sock = None
         self._servers = None
@@ -359,22 +361,26 @@ class DNSResolver(object):
         loop.add(self._sock, eventloop.POLL_IN, self)
         loop.add_periodic(self.handle_periodic)
 
+    def _run_callback(self, callback, result, error):
+        try:
+            callback(result, error)
+        except Exception:
+            logging.exception('DNS callback failed')
+
     def _call_callback(self, hostname, ip, error=None):
-        callbacks = self._hostname_to_cb.get(hostname, [])
+        # Detach the whole request before calling application code. A callback
+        # may immediately resolve the same hostname again, or raise an error.
+        callbacks = self._hostname_to_cb.pop(hostname, [])
+        self._hostname_to_last_time.pop(hostname, None)
+        self._hostname_status.pop(hostname, None)
+        self._pending_callback_count -= len(callbacks)
         for callback in callbacks:
-            if callback in self._cb_to_hostname:
+            if self._cb_to_hostname.get(callback) == hostname:
                 del self._cb_to_hostname[callback]
-            if ip or error:
-                callback((hostname, ip), error)
-            else:
-                callback((hostname, None),
-                         Exception('unable to parse hostname %s' % hostname))
-        if hostname in self._hostname_to_cb:
-            del self._hostname_to_cb[hostname]
-        if hostname in self._hostname_to_last_time:
-            del self._hostname_to_last_time[hostname]
-        if hostname in self._hostname_status:
-            del self._hostname_status[hostname]
+        if not ip and error is None:
+            error = Exception('unable to parse hostname %s' % hostname)
+        for callback in callbacks:
+            self._run_callback(callback, (hostname, ip), error)
 
     def _handle_data(self, data):
         response = parse_response(data)
@@ -440,8 +446,12 @@ class DNSResolver(object):
         to_remove = []
         for hostname, last_t in list(self._hostname_to_last_time.items()):
             if now - last_t > DNS_PENDING_TIMEOUT:
-                to_remove.append(hostname)
-        for hostname in to_remove:
+                to_remove.append((hostname, self._hostname_to_cb[hostname]))
+        for hostname, callbacks in to_remove:
+            # A previous callback may have completed this request and started
+            # a new one for the same hostname during this sweep.
+            if self._hostname_to_cb.get(hostname) is not callbacks:
+                continue
             logging.warn('DNS resolver timeout for %s', hostname)
             self._call_callback(hostname, None, Exception('DNS request timeout'))
 
@@ -452,6 +462,7 @@ class DNSResolver(object):
             arr = self._hostname_to_cb.get(hostname, None)
             if arr:
                 arr.remove(callback)
+                self._pending_callback_count -= 1
                 if not arr:
                     del self._hostname_to_cb[hostname]
                     if hostname in self._hostname_to_last_time:
@@ -461,32 +472,43 @@ class DNSResolver(object):
 
     def _send_req(self, hostname, qtype):
         req = build_request(hostname, qtype)
+        sent = False
+        error = None
         for server in self._servers:
             logging.debug('resolving %s with type %d using server %s',
                           hostname, qtype, server)
-            self._sock.sendto(req, server)
+            try:
+                self._sock.sendto(req, server)
+                sent = True
+            except (OSError, IOError) as exc:
+                error = exc
+        if not sent:
+            self._call_callback(hostname, None,
+                                error or Exception('no DNS server available'))
 
     def resolve(self, hostname, callback):
         if type(hostname) != bytes:
             hostname = hostname.encode('utf8')
         if not hostname:
-            callback(None, Exception('empty hostname'))
+            self._run_callback(callback, None, Exception('empty hostname'))
         elif common.is_ip(hostname):
-            callback((hostname, hostname), None)
+            self._run_callback(callback, (hostname, hostname), None)
         elif hostname in self._hosts:
             logging.debug('hit hosts: %s', hostname)
             ip = self._hosts[hostname]
-            callback((hostname, ip), None)
+            self._run_callback(callback, (hostname, ip), None)
         elif hostname in self._cache:
             logging.debug('hit cache: %s', hostname)
             ip = self._cache[hostname]
-            callback((hostname, ip), None)
+            self._run_callback(callback, (hostname, ip), None)
         else:
             if hostname.lower().rstrip(b'.').endswith(b'.local'):
-                callback(None, None)
+                self._run_callback(callback, None,
+                                   Exception('local hostname is not supported: %s' % hostname))
                 return
             if not is_valid_hostname(hostname):
-                callback(None, Exception('invalid hostname: %s' % hostname))
+                self._run_callback(callback, None,
+                                   Exception('invalid hostname: %s' % hostname))
                 return
             if False:
                 addrs = socket.getaddrinfo(hostname, 0, 0,
@@ -498,29 +520,39 @@ class DNSResolver(object):
                     callback((hostname, sa[0]), None)
                     return
             arr = self._hostname_to_cb.get(hostname, None)
+            if self._pending_callback_count >= DNS_MAX_TOTAL_PENDING_CALLBACKS:
+                self._run_callback(callback, None,
+                                   Exception('DNS total pending queue limit reached'))
+                return
             if not arr:
                 if IPV6_CONNECTION_SUPPORT:
                     self._hostname_status[hostname] = STATUS_IPV6
-                    self._send_req(hostname, QTYPE_AAAA)
                 else:
                     self._hostname_status[hostname] = STATUS_IPV4
-                    self._send_req(hostname, QTYPE_A)
                 self._hostname_to_cb[hostname] = [callback]
                 self._hostname_to_last_time[hostname] = time.time()
                 self._cb_to_hostname[callback] = hostname
+                self._pending_callback_count += 1
             else:
                 if len(arr) >= DNS_MAX_PENDING_CALLBACKS:
                     logging.warn('DNS pending queue for %s reached limit %d',
                                  hostname, DNS_MAX_PENDING_CALLBACKS)
-                    callback(None, Exception('DNS pending queue limit reached: %s' % hostname))
+                    self._run_callback(callback, None,
+                                       Exception('DNS pending queue limit reached: %s' % hostname))
                     return
                 arr.append(callback)
                 self._cb_to_hostname[callback] = hostname
-                # TODO send again only if waited too long
-                if IPV6_CONNECTION_SUPPORT:
-                    self._send_req(hostname, QTYPE_AAAA)
-                else:
-                    self._send_req(hostname, QTYPE_A)
+                self._pending_callback_count += 1
+                # Share the in-flight lookup and its deadline. Resending for
+                # every waiter creates bursts and a failed resend must not
+                # discard an earlier request that was successfully sent.
+                return
+            # Register before sending so even a synchronous send failure can
+            # complete and release every waiter, including this one.
+            if IPV6_CONNECTION_SUPPORT:
+                self._send_req(hostname, QTYPE_AAAA)
+            else:
+                self._send_req(hostname, QTYPE_A)
 
     def close(self):
         if self._sock:

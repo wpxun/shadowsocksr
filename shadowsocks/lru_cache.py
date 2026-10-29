@@ -64,6 +64,10 @@ class LRUCache(MutableMapping):
         self._keys_to_last_time[key] = t
         return self._store[key]
 
+    def peek(self, key, default=None):
+        """Inspect an entry without extending its lifetime."""
+        return self._store.get(key, default)
+
     def __setitem__(self, key, value):
         # O(1)
         t = time.time()
@@ -92,11 +96,12 @@ class LRUCache(MutableMapping):
             for key in self._keys_to_last_time:
                 return key
 
-    def sweep(self):
-        # O(n - m)
+    def sweep(self, sweep_item_cnt=SWEEP_MAX_ITEMS):
+        # Bound each pass so expired connections cannot monopolize the loop.
+        # False means the budget was exhausted; another pass may be needed.
         now = time.time()
         c = 0
-        while True:
+        while c < sweep_item_cnt:
             if len(self._keys_to_last_time) == 0:
                 break
             for key in self._keys_to_last_time:
@@ -112,7 +117,7 @@ class LRUCache(MutableMapping):
             c += 1
         if c:
             logging.debug('%d keys swept' % c)
-        return c < SWEEP_MAX_ITEMS
+        return c < sweep_item_cnt
 
     def clear(self, keep):
         now = time.time()

@@ -53,6 +53,20 @@ obfs_map = {
         'auth_aes128_sha1': (create_auth_aes128_sha1,),
 }
 
+CLIENT_CACHE_SWEEP_INTERVAL = 60
+
+
+def sweep_client_cache(cache):
+    """Expire authentication state by protocol lifetime, without LRU touches."""
+    now = time.time()
+    if now - getattr(cache, '_last_client_sweep', 0) < CLIENT_CACHE_SWEEP_INTERVAL:
+        return
+    cache._last_client_sweep = now
+    for client_id in list(cache):
+        if cache.peek(client_id).is_expired(now):
+            del cache[client_id]
+
+
 def match_begin(str1, str2):
     if len(str1) >= len(str2):
         if str1[:len(str2)] == str2:
@@ -108,6 +122,9 @@ class client_queue(object):
     def is_active(self):
         return time.time() - self.last_update < 60 * 3
 
+    def is_expired(self, now):
+        return now - self.last_update >= 60 * 3
+
     def re_enable(self, connection_id):
         self.enable = True
         self.front = connection_id - 64
@@ -147,7 +164,7 @@ class obfs_auth_v2_data(object):
         self.set_max_client(64) # max active client count
 
     def update(self, client_id, connection_id):
-        self.client_id.sweep()
+        sweep_client_cache(self.client_id)
         if client_id in self.client_id:
             self.client_id[client_id].update()
 
@@ -156,7 +173,7 @@ class obfs_auth_v2_data(object):
         self.max_buffer = max(self.max_client * 2, 1024)
 
     def insert(self, client_id, connection_id):
-        self.client_id.sweep()
+        sweep_client_cache(self.client_id)
         if self.client_id.get(client_id, None) is None or not self.client_id[client_id].enable:
             if self.client_id.first() is None or len(self.client_id) < self.max_client:
                 if client_id not in self.client_id:
@@ -166,8 +183,9 @@ class obfs_auth_v2_data(object):
                     self.client_id[client_id].re_enable(connection_id)
                 return self.client_id[client_id].insert(connection_id)
 
-            if not self.client_id[self.client_id.first()].is_active():
-                del self.client_id[self.client_id.first()]
+            oldest_client_id = self.client_id.first()
+            if not self.client_id.peek(oldest_client_id).is_active():
+                del self.client_id[oldest_client_id]
                 if client_id not in self.client_id:
                     #TODO: check
                     self.client_id[client_id] = client_queue(connection_id)
@@ -413,13 +431,21 @@ class obfs_auth_mu_data(object):
         self.connection_id = 0
         self.set_max_client(64) # max active client count
 
-    def update(self, user_id, client_id, connection_id):
-        if user_id not in self.user_id:
-            self.user_id[user_id] = lru_cache.LRUCache()
-        local_client_id = self.user_id[user_id]
-        local_client_id.sweep()
+    def _get_client_cache(self, user_id, create=False):
+        cache = self.user_id.get(user_id)
+        if cache is not None:
+            sweep_client_cache(cache)
+            if not cache:
+                del self.user_id[user_id]
+                cache = None
+        if cache is None and create:
+            cache = lru_cache.LRUCache()
+            self.user_id[user_id] = cache
+        return cache
 
-        if client_id in local_client_id:
+    def update(self, user_id, client_id, connection_id):
+        local_client_id = self._get_client_cache(user_id)
+        if local_client_id is not None and client_id in local_client_id:
             local_client_id[client_id].update()
 
     def set_max_client(self, max_client):
@@ -427,10 +453,7 @@ class obfs_auth_mu_data(object):
         self.max_buffer = max(self.max_client * 2, 1024)
 
     def insert(self, user_id, client_id, connection_id):
-        if user_id not in self.user_id:
-            self.user_id[user_id] = lru_cache.LRUCache()
-        local_client_id = self.user_id[user_id]
-        local_client_id.sweep()
+        local_client_id = self._get_client_cache(user_id, create=True)
 
         if local_client_id.get(client_id, None) is None or not local_client_id[client_id].enable:
             if local_client_id.first() is None or len(local_client_id) < self.max_client:
@@ -441,8 +464,9 @@ class obfs_auth_mu_data(object):
                     local_client_id[client_id].re_enable(connection_id)
                 return local_client_id[client_id].insert(connection_id)
 
-            if not local_client_id[local_client_id.first()].is_active():
-                del local_client_id[local_client_id.first()]
+            oldest_client_id = local_client_id.first()
+            if not local_client_id.peek(oldest_client_id).is_active():
+                del local_client_id[oldest_client_id]
                 if client_id not in local_client_id:
                     #TODO: check
                     local_client_id[client_id] = client_queue(connection_id)
